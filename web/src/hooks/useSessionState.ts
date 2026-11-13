@@ -7,8 +7,8 @@
 // sidebar no longer renders a "disconnected" badge and `getSessionState`
 // no longer reads runner liveness.
 //
-// Errors are independent of read state. Native sessions can settle to idle
-// after an error, so callers also inspect the latest conversation message.
+// Errors are independent of read state and come only from the server's
+// latest-activity label (see `latestErrorFromLabels`).
 
 import type { Conversation } from "@/hooks/useConversations";
 import type { LatestSessionError } from "@/lib/sessionError";
@@ -44,8 +44,7 @@ export function getSessionState(
   }
   if (conversation?.status === "running") return { kind: "running" };
   if (latestError === "disconnected") return { kind: "disconnected" };
-  const failed = conversation?.status === "failed" || latestError === "error";
-  if (failed && latestError !== "recovered_disconnect") return { kind: "error" };
+  if (latestError === "error") return { kind: "error" };
   if (conversation?.background_work_running) return { kind: "running", background: true };
   return null;
 }

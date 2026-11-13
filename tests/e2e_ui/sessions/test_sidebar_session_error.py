@@ -7,9 +7,10 @@ from typing import Literal
 
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Locator, Page, Request, expect
 
 from omnigent.entities import ErrorData, NewConversationItem
+from omnigent.stores.conversation_store.activity_error import LATEST_ACTIVITY_ERROR_LABEL_KEY
 from tests.e2e_ui.conftest import seed_committed_items, seed_committed_turn
 
 _ERROR_MESSAGE = "API Error: Request rejected (429): Exceeded input tokens per minute rate limit."
@@ -62,6 +63,25 @@ def _publish_status(
         timeout=10.0,
     )
     response.raise_for_status()
+
+
+def _publish_failure(
+    base_url: str, session_id: str, *, response_id: str = _ERROR_RESPONSE_ID
+) -> None:
+    """Publish a failed status and the error item it streams with, as the badge reads it."""
+    _publish_status(base_url, session_id, "failed", response_id=response_id)
+    seed_committed_items(
+        session_id,
+        [
+            NewConversationItem(
+                type="error",
+                response_id=response_id,
+                data=ErrorData(
+                    source="execution", code="native_turn_error", message=_ERROR_MESSAGE
+                ),
+            )
+        ],
+    )
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -150,7 +170,7 @@ def test_live_native_failure_flags_an_unopened_session(
 
     _publish_status(base_url, session_id, "running")
     expect(row.locator('[data-state="running"]')).to_be_visible(timeout=15_000)
-    _publish_status(base_url, session_id, "failed")
+    _publish_failure(base_url, session_id)
     expect(_error_badge(row)).to_be_visible(timeout=15_000)
 
     row.locator(f'a[href="/c/{session_id}"]').click()
@@ -173,7 +193,7 @@ def test_recovered_status_clears_the_session_error(
 ) -> None:
     """Resumed work clears the badge and a later idle status keeps it cleared."""
     base_url, session_id = seeded_session
-    _publish_status(base_url, session_id, "failed")
+    _publish_failure(base_url, session_id)
     page.goto(base_url)
     row = _row(page, session_id)
     expect(_error_badge(row)).to_be_visible(timeout=30_000)
@@ -286,3 +306,47 @@ def test_idle_structured_error_flags_an_unopened_session(
     expect(_error_badge(row).locator("svg")).to_have_css(
         "color", headline.evaluate("element => getComputedStyle(element).color")
     )
+
+
+def _item_reads(page: Page, session_id: str) -> list[str]:
+    """Record every item-list request the page makes for one session."""
+    reads: list[str] = []
+
+    def _on_request(request: Request) -> None:
+        if f"/v1/sessions/{session_id}/items" in request.url:
+            reads.append(request.url)
+
+    page.on("request", _on_request)
+    return reads
+
+
+def test_labelled_session_badges_from_the_list_without_reading_items(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The server's latest-activity label drives the badge with no item reads."""
+    base_url, session_id = seeded_session
+    seed_committed_turn(
+        session_id,
+        prompt="Please continue.",
+        reply=_ERROR_MESSAGE,
+        response_id=_ERROR_RESPONSE_ID,
+    )
+    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}?include_items=false", timeout=10.0)
+    snapshot.raise_for_status()
+    assert snapshot.json()["labels"][LATEST_ACTIVITY_ERROR_LABEL_KEY] == "error"
+
+    reads = _item_reads(page, session_id)
+    page.goto(base_url)
+    row = _row(page, session_id)
+    expect(_error_badge(row)).to_be_visible(timeout=30_000)
+
+    # Newer activity arrives on the updates stream and clears the badge.
+    seed_committed_turn(
+        session_id,
+        prompt="Please try again.",
+        reply="Recovered successfully.",
+        response_id="resp_sidebar_label_recovered",
+    )
+    expect(_error_badge(row)).to_have_count(0, timeout=30_000)
+    assert reads == []
